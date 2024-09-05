@@ -1,5 +1,4 @@
 import {memory,nextFrame} from '@tensorflow/tfjs';
-
 const tf = {memory,nextFrame};
 import ControllerWorker  from "./controller.worker.js?worker&inline";
 import {Tracker} from './tracker/tracker.js';
@@ -14,7 +13,7 @@ const DEFAULT_WARMUP_TOLERANCE = 5;
 const DEFAULT_MISS_TOLERANCE = 5;
 
 class Controller {
-  constructor({inputWidth, inputHeight, onUpdate=null, debugMode=false, maxTrack=1, 
+  constructor({inputWidth, inputHeight, onUpdate=null, debugMode=false, stayVisible=false, stayVisibleScale=50, maxTrack=1,
     warmupTolerance=null, missTolerance=null, filterMinCF=null, filterBeta=null}) {
 
     this.inputWidth = inputWidth;
@@ -29,6 +28,8 @@ class Controller {
     this.markerDimensions = null;
     this.onUpdate = onUpdate;
     this.debugMode = debugMode;
+    this.stayVisible = stayVisible;
+    this.stayVisibleScale = stayVisibleScale;
     this.processingVideo = false;
     this.interestedTargetIndex = -1;
     this.trackingStates = [];
@@ -130,21 +131,6 @@ class Controller {
     return this.projectionMatrix;
   }
 
-  getRotatedZ90Matrix(m) { // rotate 90 degree along z-axis
-    // rotation matrix
-    // |  0  -1  0  0 |
-    // |  1   0  0  0 |
-    // |  0   0  1  0 |
-    // |  0   0  0  1 |
-    const rotatedMatrix = [
-      -m[1], m[0], m[2], m[3],
-      -m[5], m[4], m[6], m[7],
-      -m[9], m[8], m[10], m[11],
-      -m[13], m[12], m[14], m[15]
-    ];
-    return rotatedMatrix;
-  }
-
   getWorldMatrix(modelViewTransform, targetIndex) {
     return this._glModelViewMatrix(modelViewTransform, targetIndex);
   }
@@ -189,7 +175,7 @@ class Controller {
 	  return acc + (!!s.isTracking? 1: 0);
 	}, 0);
 
-	// detect and match only if less then maxTrack
+	// detect and match only if less than maxTrack
 	if (nTracking < this.maxTrack) {
 
 	  const matchingIndexes = [];
@@ -212,19 +198,17 @@ class Controller {
 	// tracking update
 	for (let i = 0; i < this.trackingStates.length; i++) {
 	  const trackingState = this.trackingStates[i];
-
-	  if (trackingState.isTracking) {
+	  if (trackingState.isTracking && trackingState.currentModelViewTransform) {
 	    let modelViewTransform = await this._trackAndUpdate(inputT, trackingState.currentModelViewTransform, i);
 	    if (modelViewTransform === null) {
-	      trackingState.isTracking = false;
+            trackingState.isTracking = false;
 	    } else {
 	      trackingState.currentModelViewTransform = modelViewTransform;
 	    }
 	  }
-
 	  // if not showing, then show it once it reaches warmup number of frames
 	  if (!trackingState.showing) {
-	    if (trackingState.isTracking) {
+	    if (trackingState.isTracking || this.stayVisible) {
 	      trackingState.trackMiss = 0;
 	      trackingState.trackCount += 1;
 	      if (trackingState.trackCount > this.warmupTolerance) {
@@ -234,39 +218,44 @@ class Controller {
 	      }
 	    }
 	  }
-	  
+
 	  // if showing, then count miss, and hide it when reaches tolerance
 	  if (trackingState.showing) {
 	    if (!trackingState.isTracking) {
 	      trackingState.trackCount = 0;
 	      trackingState.trackMiss += 1;
-
-	      if (trackingState.trackMiss > this.missTolerance) {
-		trackingState.showing = false;
-		trackingState.trackingMatrix = null;
-		this.onUpdate && this.onUpdate({type: 'updateMatrix', targetIndex: i, worldMatrix: null});
+	      if (trackingState.trackMiss > this.missTolerance && !this.stayVisible) {
+            trackingState.showing = false;
+            trackingState.trackingMatrix = null;
+            this.onUpdate && this.onUpdate({type: 'updateMatrix', targetIndex: i, worldMatrix: null, targetPresent: false});
 	      }
 	    } else {
 	      trackingState.trackMiss = 0;
 	    }
 	  }
-	  
 	  // if showing, then call onUpdate, with world matrix
 	  if (trackingState.showing) {
-	    const worldMatrix = this._glModelViewMatrix(trackingState.currentModelViewTransform, i);
+          let worldMatrix = [], targetPresent;
+	      if (trackingState.trackMiss <= this.missTolerance && trackingState.currentModelViewTransform) {
+              worldMatrix = this._glModelViewMatrix(trackingState.currentModelViewTransform, i);
+              targetPresent = true;
+          }
+          else if (this.stayVisible) {
+              // if target is not present and stayVisible is true, use "fake" worldMatrix that centers objects on the screen
+              const dimensions = this.markerDimensions[i];
+              worldMatrix = [
+                1, 0, 0, 0, 0, 1, 0, 0, -0, -0, 1, 0, -dimensions[0] / 2, -dimensions[1] / 2,
+                -(dimensions[0] * dimensions[1]) / (100 + this.stayVisibleScale), 1
+              ];
+              targetPresent = false;
+          }
 	    trackingState.trackingMatrix = trackingState.filter.filter(Date.now(), worldMatrix);
 
-	    let clone = [];
+	    const clone = [];
 	    for (let j = 0; j < trackingState.trackingMatrix.length; j++) {
 	      clone[j] = trackingState.trackingMatrix[j];
 	    }
-
-      const isInputRotated = input.width === this.inputHeight && input.height === this.inputWidth;
-      if (isInputRotated) {
-        clone = this.getRotatedZ90Matrix(clone);
-      }
-
-	    this.onUpdate && this.onUpdate({type: 'updateMatrix', targetIndex: i, worldMatrix: clone});
+	    this.onUpdate && this.onUpdate({type: 'updateMatrix', targetIndex: i, worldMatrix: clone, targetPresent: targetPresent});
 	  }
 	}
 
@@ -329,7 +318,7 @@ class Controller {
   _glModelViewMatrix(modelViewTransform, targetIndex) {
     const height = this.markerDimensions[targetIndex][1];
 
-    // Question: can someone verify this interpreation is correct? 
+    // Question: can someone verify this interpreation is correct?
     // I'm not very convinced, but more like trial and error and works......
     //
     // First, opengl has y coordinate system go from bottom to top, while the marker corrdinate goes from top to bottom,
@@ -340,7 +329,7 @@ class Controller {
     //    [0 -1  0  h]
     //    [0  0 -1  0]
     //    [0  0  0  1]
-    //    
+    //
     //    This is tested that if we reverse marker coordinate from bottom to top and estimate the modelViewTransform,
     //    then the above matrix is not necessary.
     //
